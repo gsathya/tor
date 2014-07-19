@@ -88,6 +88,18 @@ struct evdns_request;
  * that the resolver is wedged? */
 #define RESOLVE_MAX_TIMEOUT 300
 
+/* What are the ip addresses of the Google DNS nameservers? */
+static const char *GOOGLE_DNS[] = {
+  "8.8.8.8",
+  "8.8.4.4"
+};
+
+/* What are the ip addresses of the OpenDNS nameservers? */
+static char *OPEN_DNS[] = {
+  "208.67.222.222",
+  "208.67.220.220"
+};
+
 /** Our evdns_base; this structure handles all our name lookups. */
 static struct evdns_base *the_evdns_base = NULL;
 
@@ -1445,7 +1457,7 @@ configure_nameservers(int force)
   const or_options_t *options;
   const char *conf_fname;
   struct stat st;
-  int r, flags;
+  int r, flags, i;
   options = get_options();
   conf_fname = options->ServerDNSResolvConfFile;
 #ifndef _WIN32
@@ -1517,6 +1529,7 @@ configure_nameservers(int force)
     tor_free(resolv_conf_fname);
     resolv_conf_fname = tor_strdup(conf_fname);
     resolv_conf_mtime = st.st_mtime;
+
     if (nameservers_configured)
       evdns_base_resume(the_evdns_base);
   }
@@ -1540,6 +1553,15 @@ configure_nameservers(int force)
     tor_free(resolv_conf_fname);
     resolv_conf_mtime = 0;
   }
+#endif
+
+#ifdef HAVE_EVENT2_DNS_H
+  for (i = 0; i < sizeof(GOOGLE_DNS)/sizeof(GOOGLE_DNS[0]); i++)
+    if (evdns_base_is_nameserver_present(the_evdns_base, GOOGLE_DNS[i]))
+      log_warn(LD_EXIT, "Don't use Google DNS: %s", GOOGLE_DNS[i]);
+  for (i = 0; i < sizeof(OPEN_DNS)/sizeof(OPEN_DNS[0]); i++)
+    if (evdns_base_is_nameserver_present(the_evdns_base, OPEN_DNS[i]))
+      log_warn(LD_EXIT, "Don't use OpenDNS: %s", OPEN_DNS[i]);
 #endif
 
 #define SET(k,v)  evdns_base_set_option_(the_evdns_base, (k), (v))
