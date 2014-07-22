@@ -1950,14 +1950,15 @@ circuits_compare_by_oldest_queued_item_(const void **a_, const void **b_)
 void
 circuits_handle_oom(size_t current_allocation)
 {
-  /* Let's hope there's enough slack space for this allocation here... */
-  smartlist_t *circlist = smartlist_new();
+  smartlist_t *circlist;
   circuit_t *circ;
   size_t mem_to_recover;
   size_t mem_recovered=0;
   int n_circuits_killed=0;
   struct timeval now;
   uint32_t now_ms;
+  int n_circs = 0;
+
   log_notice(LD_GENERAL, "We're low on memory.  Killing circuits with "
              "over-long queues. (This behavior is controlled by "
              "MaxMemInQueues.)");
@@ -1984,37 +1985,79 @@ circuits_handle_oom(size_t current_allocation)
   tor_gettimeofday_cached_monotonic(&now);
   now_ms = (uint32_t)tv_to_msec(&now);
 
-  /* This algorithm itself assumes that you've got enough memory slack
-   * to actually run it. */
   TOR_LIST_FOREACH(circ, &global_circuitlist, head) {
     circ->age_tmp = circuit_max_queued_item_age(circ, now_ms);
-    smartlist_add(circlist, circ);
+    ++n_circs;
   }
 
-  /* This is O(n log n); there are faster algorithms we could use instead.
-   * Let's hope this doesn't happen enough to be in the critical path. */
-  smartlist_sort(circlist, circuits_compare_by_oldest_queued_item_);
+  const size_t mem_remaining = (size_t) (get_options()->MaxMemInQueues) -
+                                         current_allocation;
+  const size_t mem_to_be_allocated = n_circs * sizeof(void*);
 
-  /* Okay, now the worst circuits are at the front of the list. Let's mark
-   * them, and reclaim their storage aggressively. */
-  SMARTLIST_FOREACH_BEGIN(circlist, circuit_t *, circ) {
-    size_t n = n_cells_in_circ_queues(circ);
-    size_t freed;
-    if (! circ->marked_for_close) {
-      circuit_mark_for_close(circ, END_CIRC_REASON_RESOURCELIMIT);
+  /* We don't have enough memory to allocate a smartlist, */
+  /* let's do this the slow way. */
+  if (mem_to_be_allocated > mem_remaining){
+    circuit_t *circ_to_be_deleted;
+
+    while (mem_recovered <= mem_to_recover){
+      circ_to_be_deleted = NULL;
+
+      TOR_LIST_FOREACH(circ, &global_circuitlist, head) {
+        if (circ_to_be_deleted == NULL ||
+            circ_to_be_deleted->age_tmp < circ->age_tmp) {
+          circ_to_be_deleted = circ;
+        }
+      }
+       /* Looks like we've run out of circs. */
+      if (circ_to_be_deleted == NULL){
+        break;
+      }
+      size_t n = n_cells_in_circ_queues(circ);
+      size_t freed;
+      if (! circ_to_be_deleted->marked_for_close) {
+        circuit_mark_for_close(circ_to_be_deleted, END_CIRC_REASON_RESOURCELIMIT);
+      }
+      marked_circuit_free_cells(circ_to_be_deleted);
+      freed = marked_circuit_free_stream_bytes(circ_to_be_deleted);
+
+      ++n_circuits_killed;
+
+      mem_recovered += n * packed_cell_mem_cost();
+      mem_recovered += freed;
     }
-    marked_circuit_free_cells(circ);
-    freed = marked_circuit_free_stream_bytes(circ);
+  } else {
+    circlist = smartlist_new();
 
-    ++n_circuits_killed;
+    TOR_LIST_FOREACH(circ, &global_circuitlist, head) {
+      smartlist_add(circlist, circ);
+    }
 
-    mem_recovered += n * packed_cell_mem_cost();
-    mem_recovered += freed;
+    /* This is O(n log n); there are faster algorithms we could use instead.
+     * Let's hope this doesn't happen enough to be in the critical path. */
+    smartlist_sort(circlist, circuits_compare_by_oldest_queued_item_);
 
-    if (mem_recovered >= mem_to_recover)
-      break;
-  } SMARTLIST_FOREACH_END(circ);
+    /* Okay, now the worst circuits are at the front of the list. Let's mark
+     * them, and reclaim their storage aggressively. */
+    SMARTLIST_FOREACH_BEGIN(circlist, circuit_t *, circ) {
+      size_t n = n_cells_in_circ_queues(circ);
+      size_t freed;
+      if (! circ->marked_for_close) {
+        circuit_mark_for_close(circ, END_CIRC_REASON_RESOURCELIMIT);
+      }
+      marked_circuit_free_cells(circ);
+      freed = marked_circuit_free_stream_bytes(circ);
 
+      ++n_circuits_killed;
+
+      mem_recovered += n * packed_cell_mem_cost();
+      mem_recovered += freed;
+
+      if (mem_recovered >= mem_to_recover)
+        break;
+    } SMARTLIST_FOREACH_END(circ);
+
+    smartlist_free(circlist);
+  }
 #ifdef ENABLE_MEMPOOLS
   clean_cell_pool(); /* In case this helps. */
 #endif /* ENABLE_MEMPOOLS */
@@ -2025,9 +2068,8 @@ circuits_handle_oom(size_t current_allocation)
              "%d circuits remain alive.",
              U64_PRINTF_ARG(mem_recovered),
              n_circuits_killed,
-             smartlist_len(circlist) - n_circuits_killed);
+             n_circs - n_circuits_killed);
 
-  smartlist_free(circlist);
 }
 
 /** Verify that cpath layer <b>cp</b> has all of its invariants
